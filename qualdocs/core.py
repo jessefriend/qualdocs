@@ -1,25 +1,23 @@
-from __future__ import print_function
 import httplib2
 import os
 
-from apiclient import discovery
+from googleapiclient import discovery
 from oauth2client import client
 from oauth2client import tools
 from oauth2client.file import Storage
 
 from collections import Counter
 
-import json
 import pandas as pd
 import numpy as np
 
 import re 
 
+
 def get_service(client_secret=None):
     """
     Returns a service object for use with Drive API queries based on the contents of ~/.credentials/
     """
-
 
     credentials = get_credentials(client_secret)
     http = credentials.authorize(httplib2.Http())
@@ -28,32 +26,38 @@ def get_service(client_secret=None):
     return service
 
 
-def get_file_ids(service, search=None, max_files=250):
-    """
-    Get a dictionary of filenames:file_ids from the authenticated Drive account. 
-    Can filter with search string. Returns / searches through most recent 250 files by default.
-
-    Returns:
-        file_ids, a dictionary of filenames:file_ids    
-    """
+def get_folder_ids(service, search=None, max_files=250):
 
 
-    file_ids = {}
-
-    results = service.files().list(
-        pageSize=max_files,fields="nextPageToken, files(id, name)").execute()
-    items = results.get('files', [])
+    folder_ids= {}
+    response = service.files().list(q="mimeType='application/vnd.google-apps.folder'",
+                                         spaces='drive',
+                                         fields='nextPageToken, files(id, name)').execute()
+    items = response.get('files', [])     
 
     if not items:
-        print('No files found.')
+#         print('No files found.')
         return None
 
 
     for item in items:
         #print('{0} ({1})'.format(item['name'], item['id']))
-        if search is None or item['name'].find(search) > 0:
-            file_ids[item['name']] = item['id']
+        if search is None or item['name'].find(search) > -1:
+            folder_ids[item['id']]=item['id']
+            
+    return folder_ids
 
+def get_file_ids(service, folder_ids):
+
+    file_ids = {}
+    
+    for folder_id in folder_ids:
+        query = "'{}' in parents".format(folder_id)
+        children = service.files().list(q=query, fields='nextPageToken, files(id, name)').execute()
+    
+    for child in children.get('files', []):
+        file_ids[child['name']]=child['id'] 
+            
     return file_ids
 
 def is_interactive():
@@ -76,7 +80,7 @@ def get_credentials(client_secret=None):
     sys.argv=['']
 
 
-    SCOPES = 'https://www.googleapis.com/auth/drive.readonly'
+    SCOPES = 'https://www.googleapis.com/auth/drive'
 
     if client_secret:
         CLIENT_SECRET_FILE = client_secret
@@ -98,7 +102,7 @@ def get_credentials(client_secret=None):
         flow = client.flow_from_clientsecrets(CLIENT_SECRET_FILE, SCOPES)
         flow.user_agent = APPLICATION_NAME
         credentials = tools.run_flow(flow, store)
-        print('Storing credentials to ' + credential_path)
+#         print('Storing credentials to ' + credential_path)
     return credentials
 
 
@@ -120,8 +124,8 @@ def get_json_dict(service, file_ids):
         service_c = service.comments()
         c_json_dict[name] = service_c.list(pageSize=100,
                                            fileId=file_id,
-                                           fields="comments,kind,nextPageToken").execute()
-
+                                           fields="comments, kind, nextPageToken").execute()
+#     print(c_json_dict)   
     return c_json_dict
 
 
@@ -210,9 +214,11 @@ def process_code(rawcode, text, code_replace_dict=None):
                 return_list.append((code_concat, text))
             return return_list
 
+def df_add_links(comments_df, file_ids):
+    return
 
 
-def json_to_df(comments_json_dict, code_replace_dict=None):
+def json_to_df(comments_json_dict, doc_ids = None, code_replace_dict=None):
     """
     Converts a dictionary of JSON responses from the API to a pandas dataframe
     with a hierarchical index.
@@ -225,7 +231,7 @@ def json_to_df(comments_json_dict, code_replace_dict=None):
     """
 
 
-    codes_df = pd.DataFrame(columns=["code","subcode","sub_subcode", "name", "text", "comment_id", "coder"])
+    codes_df = pd.DataFrame(columns=["code","subcode","sub_subcode", "name", "text", "comment_id", "coder", "url"])
 
     for name, comments_json in comments_json_dict.items():
 
@@ -234,30 +240,67 @@ def json_to_df(comments_json_dict, code_replace_dict=None):
             coded_text = comment['quotedFileContent']['value']
             raw_codes = comment['htmlContent']
             comment_id = comment['id']
-            comment_author = comment['author']['displayName']
-
-            #print(raw_codes)
-
-            if raw_codes.find("<br>") == -1:
-
-                process_result = process_code(raw_codes, coded_text, code_replace_dict)
-                #print(process_result)
-                for result in process_result:
-
-                    codes_dict = {'code':result[0], 'name':name, 'text':result[1], 'comment_id': comment_id, "coder":comment_author}
-                    codes_df = codes_df.append(pd.Series(codes_dict), ignore_index=True)    
-
+            comment_author = comment['author']['displayName'] 
+            
+            if doc_ids is not None:
+                url = "https://docs.google.com/document/d/"
+                url = url + doc_ids[name] + "/edit?disco="
+                url = url + comment_id
             else:
-                codes = raw_codes.split("<br>")
-                for code in codes:
-
-                    process_result = process_code(code, coded_text, code_replace_dict)
-
-                    for result in process_result:
-
-                        codes_dict = {'code':result[0], 'name':name, 'text':result[1], 'comment_id': comment_id, "coder":comment_author}
-                        codes_df = codes_df.append(pd.Series(codes_dict), ignore_index=True)
-
+                url = None
+                
+            for reply in comment['replies']:
+                if 'htmlContent' in reply: 
+                    if reply['htmlContent']!="":
+                        reply_raw_codes = reply['htmlContent']
+                        reply_id = reply['id']
+                        reply_author = reply['author']['displayName']
+                        
+                        if '[' not in reply_raw_codes:
+                            if reply_raw_codes.find("<br>") == -1:
+                                process_reply_result = process_code(reply_raw_codes, coded_text, code_replace_dict)
+                                
+                                if process_reply_result is not None:
+                                    for result in process_reply_result:
+                
+                
+                                        codes_dict = {'code':result[0], 'name':name, 'text':result[1], 'comment_id': reply_id, "coder":reply_author, "url":url}
+                                        codes_df = codes_df.append(pd.Series(codes_dict), ignore_index=True)
+                                
+                                else:
+                                    codes = reply_raw_codes.split("<br>")
+                                    for code in codes:
+                    
+                                        process_result = process_code(code, coded_text, code_replace_dict)
+                    
+                                        for result in process_result:
+                    
+                                            codes_dict = {'code':result[0], 'name':name, 'text':result[1], 'comment_id': reply_id, "coder":reply_author, "url":url}
+                                            codes_df = codes_df.append(pd.Series(codes_dict), ignore_index=True)
+                
+            if '[' not in raw_codes:
+                if raw_codes.find("<br>") == -1:
+                    process_comment_result = process_code(raw_codes, coded_text, code_replace_dict)
+                    #print(process_result)
+                    if process_comment_result is not None:
+                        for result in process_comment_result:
+    
+    
+                            codes_dict = {'code':result[0], 'name':name, 'text':result[1], 'comment_id': comment_id, "coder":comment_author, "url":url}
+                            codes_df = codes_df.append(pd.Series(codes_dict), ignore_index=True)    
+    
+                else:
+                    codes = raw_codes.split("<br>")
+                    for code in codes:
+    
+                        process_result = process_code(code, coded_text, code_replace_dict)
+    
+                        for result in process_result:
+    
+                            codes_dict = {'code':result[0], 'name':name, 'text':result[1], 'comment_id': comment_id, "coder":comment_author, "url":url}
+                            codes_df = codes_df.append(pd.Series(codes_dict), ignore_index=True)  
+   
+                    
     for row, items in codes_df.iterrows():
         #print(items['code'].split(":"))
         count = 0
@@ -280,7 +323,6 @@ def json_to_df(comments_json_dict, code_replace_dict=None):
     codes_df = codes_df.set_index(['code', 'subcode', 'sub_subcode', 'name']).sort_index()
 
     return codes_df
-    
 
 def get_code_list(codes_df):
     """
@@ -325,6 +367,5 @@ def get_code_counts(codes_df):
     code_list = get_code_list(codes_df)
 
     code_list_counter = Counter(code_list)
-
 
 
